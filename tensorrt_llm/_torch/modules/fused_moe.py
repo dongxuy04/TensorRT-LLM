@@ -3,7 +3,7 @@ import math
 import os
 import threading
 from enum import Enum, IntEnum
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -19,13 +19,13 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
+from ..model_config import ModelConfig
 from ..expert_statistic import ExpertStatistic
-from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .gated_mlp import GatedMLP
 from .linear import TensorParallelMode, load_weight_shard
-from .moe_load_balancer import MoeLoadBalancer
+from .moe_load_balancer import get_moe_load_balancer
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -898,8 +898,6 @@ class FusedMoE(nn.Module):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         enable_alltoall: bool = False,
-        moe_load_balancer: Optional[MoeLoadBalancer] = None,
-        layer_idx: Optional[int] = None,
     ):
         from ..distributed import AllReduce
 
@@ -937,47 +935,56 @@ class FusedMoE(nn.Module):
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
-        self.layer_idx = layer_idx
+        moe_load_balancer = get_moe_load_balancer()
+        self.layer_load_balancer = None
+        self.first_forward_call = True
+        self.last_forward_call = True
         moe_load_balancer_config = model_config.moe_load_balancer
-        if moe_load_balancer_config is None:
-            assert moe_load_balancer is None
-            # A dummy MoeLoadBalancerConfig to generate default initial_global_assignments
-            moe_load_balancer_config = MoeLoadBalancerConfig()
-            moe_load_balancer_config.setup(num_experts=num_experts,
-                                           ep_rank=self.ep_rank,
-                                           ep_size=self.ep_size)
-        else:
-            assert moe_load_balancer is not None
-
-        self.num_slots = moe_load_balancer_config.num_slots
-        if self.smart_router:
-            assert self.num_slots == self.num_experts, "Smart router should not have redundant slots"
-
-        self.initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
-            layer_idx)
-        self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
-        self.slot_start = moe_load_balancer_config.slot_start
-        self.slot_end = moe_load_balancer_config.slot_end
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
-
-        self.balancer_layer = None
-        if moe_load_balancer is not None:
-            self.balancer_layer = moe_load_balancer.add_layer(
-                expert_count=num_experts,
-                top_k=routing_method.experts_per_token,
-                slot_count_per_rank=self.expert_size_per_partition,
-            )
-            self.balancer_layer.set_initial_weight_assignments(
+        init_expert_size_per_partition = moe_load_balancer_config.num_local_slots if moe_load_balancer_config else self.num_experts // self.ep_size
+        self.initial_global_assignments = [
+            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
+            self.num_experts for ep_rank in range(self.ep_size)
+            for local_slot_id in range(init_expert_size_per_partition)
+        ]
+        if moe_load_balancer:
+            assert moe_load_balancer_config is not None
+            top_k = self.routing_method.experts_per_token
+            self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
+            self.layer_load_balancer = moe_load_balancer.add_layer(
+                self.num_experts, top_k, self.expert_size_per_partition)
+            load_balance_layer_idx = self.layer_load_balancer.get_layer_idx()
+            loaded_initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
+                load_balance_layer_idx)
+            self.num_slots = moe_load_balancer_config.num_slots
+            if loaded_initial_global_assignments is not None:
+                assert isinstance(loaded_initial_global_assignments, list)
+                assert len(loaded_initial_global_assignments) == self.num_slots
+                assert self.num_slots >= self.num_experts
+                assert set(loaded_initial_global_assignments) == set(
+                    range(self.num_experts))
+                self.initial_global_assignments = loaded_initial_global_assignments
+            self.layer_load_balancer.set_initial_weight_assignments(
                 self.initial_global_assignments)
             logger.info(
                 f"MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
             )
             logger.info(
-                f"initial_global_assignments (layer {layer_idx}) = {self.initial_global_assignments}"
+                f"initial_global_assignments (layer {load_balance_layer_idx}) = {self.initial_global_assignments}"
             )
+        else:
+            assert num_experts % self.ep_size == 0
+            self.expert_size_per_partition = num_experts // self.ep_size
+            self.num_slots = num_experts
+
+        if self.smart_router:
+            assert self.num_slots == self.num_experts, "Smart router should not have redundant slots"
+
+        self.slot_start = self.ep_rank * self.expert_size_per_partition
+        self.slot_end = self.slot_start + self.expert_size_per_partition
+        self.initial_local_expert_ids = self.initial_global_assignments[
+            self.slot_start:self.slot_end]
+        assert len(
+            self.initial_local_expert_ids) == self.expert_size_per_partition
 
         max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
@@ -1390,13 +1397,14 @@ class FusedMoE(nn.Module):
         return outputs
 
     def forward_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            cutlass_min_latency_mode: bool = False,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: Tuple = (True, True),
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -1404,31 +1412,25 @@ class FusedMoE(nn.Module):
         else:
             output_dtype = x.dtype
 
+        is_first_call, is_last_call = repeating_info
+
+        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+        ) and is_first_call:
+            self.layer_load_balancer.wait_for_gpu_stage()
+
         use_fp8_block_scaling = False
         use_w4a8_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
             router_logits)
-        if self.balancer_layer is None:
-            token_selected_slots = token_selected_experts
-        else:
-            # If attention DP is enabled, token_selected_experts is a local rank tensor,
-            # so we need to offset the round robin position by ep_rank
-            token_selected_slots = self.balancer_layer.route(
-                token_selected_experts, offset_by_ep_rank=self.use_dp)
 
-        # If load balancer is disabled, the statistics are collected from expert IDs.
-        # If load balancer is enabled, the statistics are collected from expert slot IDs.
-        ExpertStatistic.set_layer(self.layer_idx)
-        ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
-
-        assert token_selected_slots.shape[
+        assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
-        assert token_selected_slots.shape == token_final_scales.shape
-        assert token_selected_slots.shape[0] == router_logits.shape[0]
+        assert token_selected_experts.shape == token_final_scales.shape
+        assert token_selected_experts.shape[0] == router_logits.shape[0]
         assert token_final_scales.dtype == torch.float32
-        assert token_selected_slots.dtype == torch.int32
+        assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
             assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
@@ -1441,12 +1443,32 @@ class FusedMoE(nn.Module):
 
         alltoall_info = None
 
+        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+        ) and is_first_call:
+            self.layer_load_balancer.maybe_cudagraph_done_wait()
+
+        need_statistic = False
+        if self.layer_load_balancer is None:
+            token_selected_slots = token_selected_experts
+        else:
+            token_selected_slots = self.layer_load_balancer.route(
+                token_selected_experts, self.use_dp)
+            if not self.layer_load_balancer.is_static_routing():
+                need_statistic = True
+
+        # If load balancer is disabled, the statistics are collected from expert IDs.
+        # If load balancer is enabled, the statistics are collected from expert slot IDs.
+        ExpertStatistic.set_layer(self.layer_idx)
+        ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+
+        token_selected_experts_for_statistic = token_selected_experts if need_statistic else None
         if self.enable_alltoall:
-            x, token_selected_slots, token_final_scales, alltoall_info = \
+            x, token_selected_slots, token_final_scales, token_selected_experts_for_statistic, alltoall_info = \
                 self.alltoall_prepare_maybe_dispatch(all_rank_num_tokens,
                                                      x,
                                                      token_selected_slots,
-                                                     token_final_scales)
+                                                     token_final_scales,
+                                                     token_selected_experts_for_statistic)
 
         x_sf = None
         if self.has_any_quant:
@@ -1479,8 +1501,11 @@ class FusedMoE(nn.Module):
 
         if self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
         ) and not self.enable_alltoall:
-            x, x_sf, token_selected_slots, token_final_scales = allgather(
-                [x, x_sf, token_selected_slots, token_final_scales],
+            x, x_sf, token_selected_slots, token_final_scales, token_selected_experts_for_statistic = allgather(
+                [
+                    x, x_sf, token_selected_slots, token_final_scales,
+                    token_selected_experts_for_statistic
+                ],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
@@ -1488,6 +1513,12 @@ class FusedMoE(nn.Module):
             if x_sf is not None:
                 x_sf = reswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
+
+        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+        ):
+            self.layer_load_balancer.statistic(
+                token_selected_experts_for_statistic, is_first_call,
+                is_last_call)
 
         if self.smart_router and not cutlass_min_latency_mode:
             ep_size = self.cluster_size
@@ -1536,37 +1567,56 @@ class FusedMoE(nn.Module):
             tune_max_num_tokens=self.tune_max_num_tokens,
         )
 
+        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+        ) and is_last_call:
+            self.layer_load_balancer.set_cpu_stage()
+
         if cutlass_min_latency_mode:
             assert not self.reduce_results
-            return final_hidden_states
+            assert not self.enable_alltoall
         else:
             # Custom op requires all inputs are in the same type.
             # Only in cutlass_min_latency_mode, the output is a list of tensors.
             # Otherwise, the output should be unpacked as a single tensor.
             final_hidden_states = final_hidden_states[0]
 
-        if not self.enable_alltoall:
-            return final_hidden_states
-        else:
-            return self.alltoall_combine(final_hidden_states, alltoall_info,
-                                         token_count)
+        if self.enable_alltoall:
+            final_hidden_states = self.alltoall_combine(final_hidden_states,
+                                                        alltoall_info,
+                                                        token_count)
+
+        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+        ) and is_last_call:
+            self.layer_load_balancer.maybe_cudagraph_done_set_cpu_stage()
+
+        return final_hidden_states
 
     def forward(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        cutlass_min_latency_mode: bool = False,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
+            self,
+            x: Union[torch.Tensor, Fp4QuantizedTensor],
+            router_logits: torch.Tensor,
+            cutlass_min_latency_mode: bool = False,
+            output_dtype: Optional[torch.dtype] = None,
+            all_rank_num_tokens: Optional[List[int]] = None,
+            use_dp_padding: Optional[bool] = None,
+            repeating_info: Tuple = (True, True),
     ) -> torch.Tensor:
         """
         cutlass_min_latency_mode has no effect when trtllm_gen backend is enabled.
+        repeating_info: indicate if this will be called repeatedly, which will be used by MoeLoadBalancer
+          First element is if it is first call, second element is if it is last call.
+          So by default, if it is not repeated, both will be True.
+          In cases that same layer's forward called multiple times.
         """
+        self.first_forward_call, self.last_forward_call = repeating_info
         if self.is_cutlass():
-            return self.forward_cutlass(x, router_logits,
-                                        cutlass_min_latency_mode, output_dtype,
-                                        all_rank_num_tokens, use_dp_padding)
+            return self.forward_cutlass(x,
+                                        router_logits,
+                                        cutlass_min_latency_mode,
+                                        output_dtype,
+                                        all_rank_num_tokens,
+                                        use_dp_padding,
+                                        repeating_info=repeating_info)
         elif self.is_trtllm():
             return self.forward_trtllmgen(x, router_logits)
         else:
@@ -1582,6 +1632,7 @@ class FusedMoE(nn.Module):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        repeating_info: Optional[Tuple] = None,
     ) -> torch.Tensor:
         assert self.is_cutlass()
 
@@ -1613,7 +1664,8 @@ class FusedMoE(nn.Module):
                 cutlass_min_latency_mode,
                 output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
+                use_dp_padding=use_dp_padding,
+                repeating_info=repeating_info)
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
@@ -1656,6 +1708,8 @@ class FusedMoE(nn.Module):
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
             for idx_chunk, (x, router_logits) in enumerate(
                     zip(x_list, router_logits_list)):
+                is_first_call = idx_chunk == 0 and repeating_info[0]
+                is_last_call = idx_chunk == num_chunks - 1 and repeating_info[1]
                 if not self.enable_alltoall:
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
@@ -1664,7 +1718,8 @@ class FusedMoE(nn.Module):
                                 router_logits,
                                 all_rank_num_tokens=all_rank_num_tokens_list[
                                     idx_chunk] if self.use_dp else None,
-                                use_dp_padding=use_dp_padding)
+                                use_dp_padding=use_dp_padding,
+                                repeating_info=(is_first_call, is_last_call))
                         if idx_chunk > 0:
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -1677,7 +1732,8 @@ class FusedMoE(nn.Module):
                             router_logits,
                             all_rank_num_tokens=all_rank_num_tokens_list[
                                 idx_chunk] if self.use_dp else None,
-                            use_dp_padding=use_dp_padding)
+                            use_dp_padding=use_dp_padding,
+                            repeating_info=(is_first_call, is_last_call))
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = self.reducescatter_or_allreduce(
                                 outputs_list[-1],
@@ -1689,7 +1745,8 @@ class FusedMoE(nn.Module):
                         x,
                         router_logits,
                         all_rank_num_tokens=all_rank_num_tokens_list[idx_chunk]
-                        if self.use_dp else None)
+                        if self.use_dp else None,
+                        repeating_info=(is_first_call, is_last_call))
 
                 outputs_list.append(outputs)
             if not self.enable_alltoall:
@@ -1798,32 +1855,49 @@ class FusedMoE(nn.Module):
 
         return final_hidden_states
 
-    def alltoall_prepare_maybe_dispatch(self, all_rank_num_tokens: list,
-                                        x: torch.Tensor,
-                                        token_selected_slots: torch.Tensor,
-                                        token_final_scales: torch.Tensor):
+    def alltoall_prepare_maybe_dispatch(
+            self, all_rank_num_tokens: list, x: torch.Tensor,
+            token_selected_slots: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            token_selected_experts_for_statistic: Optional[torch.Tensor]):
         top_k = self.routing_method.experts_per_token
-        expert_count = self.num_experts
         # gather router info
         max_num_token = max(all_rank_num_tokens)
         token_selected_slots = torch.nn.functional.pad(
             token_selected_slots,
             (0, 0, 0, max_num_token - token_selected_slots.shape[0]),
-            'constant', self.num_experts)
+            'constant', self.num_slots)
+        token_selected_experts_for_statistic = torch.nn.functional.pad(
+            token_selected_experts_for_statistic,
+            (0, 0, 0,
+             max_num_token - token_selected_experts_for_statistic.shape[0]),
+            'constant', self.num_experts
+        ) if token_selected_experts_for_statistic is not None else None
         token_final_scales = torch.nn.functional.pad(
             token_final_scales,
             (0, 0, 0, max_num_token - token_final_scales.shape[0]))
-        gathered_token_selected_slots, gathered_token_final_scales = allgather(
-            [token_selected_slots, token_final_scales], self.mapping, dim=0)
+        gathered_token_selected_slots, gathered_token_final_scales, gathered_token_selected_experts_for_statistic = allgather(
+            [
+                token_selected_slots, token_final_scales,
+                token_selected_experts_for_statistic
+            ],
+            self.mapping,
+            dim=0)
+        if gathered_token_selected_experts_for_statistic is not None:
+            gathered_token_selected_experts_for_statistic = torch.flatten(
+                gathered_token_selected_experts_for_statistic.contiguous(),
+                start_dim=0,
+                end_dim=-2)
+
         gathered_token_selected_slots = torch.flatten(
             gathered_token_selected_slots.contiguous(), start_dim=0, end_dim=-2)
         gathered_token_final_scales = torch.flatten(
             gathered_token_final_scales.contiguous(), start_dim=0, end_dim=-2)
         gathered_target_rank_ids = MnnvlMoe.compute_target_rank_id(
-            gathered_token_selected_slots, self.num_experts, self.ep_size)
+            gathered_token_selected_slots, self.num_slots, self.ep_size)
         alltoall_info, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
             gathered_target_rank_ids, None, gathered_token_selected_slots,
-            gathered_token_final_scales, max_num_token, expert_count, top_k,
+            gathered_token_final_scales, max_num_token, self.num_slots, top_k,
             self.ep_rank, self.ep_size)
 
         if not self.use_postquant_alltoall:
@@ -1834,7 +1908,7 @@ class FusedMoE(nn.Module):
                                              self.alltoall_workspace,
                                              self.ep_rank, self.ep_size)
 
-        return x, token_selected_slots, token_final_scales, alltoall_info
+        return x, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic, alltoall_info
 
     def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
                                     x_row: int, x_col: int,
@@ -1873,6 +1947,32 @@ class FusedMoE(nn.Module):
             token_count=token_count)
 
         return final_hidden_states
+
+    def register_parameter_weight_slot_fn(self, weight_name: str,
+                                          local_slot_id: int):
+        assert hasattr(
+            self,
+            weight_name), f"FusedMoE doesn't has weight attr: {weight_name}"
+        weight_tensor = getattr(self, weight_name).data[local_slot_id]
+        self.layer_load_balancer.register_weight_slot(local_slot_id,
+                                                      weight_name,
+                                                      weight_tensor)
+
+    def register_to_fix_weight_fn(self, weight_name: str):
+        assert hasattr(
+            self,
+            weight_name), f"FusedMoE doesn't has weight attr: {weight_name}"
+        param = getattr(self, weight_name)
+        weight_tensor = param.detach()
+        assert isinstance(
+            weight_tensor,
+            torch.Tensor), f'weight {weight_name} should be a tensor'
+        assert weight_tensor.is_contiguous(
+        ), f'weight {weight_name} should be a is_contiguous, shape={weight_tensor.shape}, strides={weight_tensor.is_contiguous()}'
+        assert weight_tensor.numel() * weight_tensor.element_size() == weight_tensor.untyped_storage().size(),\
+            f'weight {weight_name} shape={weight_tensor.shape} storage_size = {weight_tensor.untyped_storage().size()}, numel={weight_tensor.numel()}, eltsize={weight_tensor.element_size()}, dtype={weight_tensor.dtype}'
+        self.layer_load_balancer.fix_tensor(weight_tensor)
+        param.data = weight_tensor
 
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
@@ -1978,51 +2078,57 @@ class FusedMoE(nn.Module):
             dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                                 non_blocking=True)
 
-        # Use multi-threading to load expert weights in parallel.
-        # Even though CPython has global interpreter lock (GIL),
-        # it's still faster to load weights in parallel because it can utilize
-        # CPU memory bandwidth better.
-        threads = []
+        def parallel_load_weights(load_expert_ids: List[int],
+                                  dst_w3_w1_weights_tensor: torch.Tensor,
+                                  dst_w2_weights_tensor: torch.Tensor):
+            # Use multi-threading to load expert weights in parallel.
+            # Even though CPython has global interpreter lock (GIL),
+            # it's still faster to load weights in parallel because it can utilize
+            # CPU memory bandwidth better.
+            threads = []
 
-        for local_slot_id, expert_id in enumerate(
-                self.initial_local_expert_ids):
-            # expert_idx is the local slot index of current rank
-            expert_idx = local_slot_id
+            for local_slot_id, expert_id in enumerate(load_expert_ids):
+                # expert_idx is the local slot index of current rank
+                expert_idx = local_slot_id
 
-            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_weight = weights[f"{expert_id}.w1.weight"]
-                w3_weight = weights[f"{expert_id}.w3.weight"]
-                w2_weight = weights[f"{expert_id}.w2.weight"]
-            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
-                    0, 1)
-                w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
-                w2_weight = weights["down_proj"][expert_id].transpose(
-                    0, 1).contiguous()
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
-                )
+                if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                    w1_weight = weights[f"{expert_id}.w1.weight"]
+                    w3_weight = weights[f"{expert_id}.w3.weight"]
+                    w2_weight = weights[f"{expert_id}.w2.weight"]
+                elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                    w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
+                        0, 1)
+                    w1_weight, w3_weight = w1_w3_weight.chunk(2, dim=0)
+                    w2_weight = weights["down_proj"][expert_id].transpose(
+                        0, 1).contiguous()
+                else:
+                    raise NotImplementedError(
+                        f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                    )
 
-            is_trtllm_nvfp4 = self.is_trtllm(
-            ) and self.quant_config.quant_mode.has_nvfp4()
+                is_trtllm_nvfp4 = self.is_trtllm(
+                ) and self.quant_config.quant_mode.has_nvfp4()
 
-            thread = threading.Thread(target=load_expert_w3_w1_weight,
-                                      args=(w1_weight, w3_weight,
-                                            self.w3_w1_weight.data[expert_idx],
-                                            is_trtllm_nvfp4))
-            thread.start()
-            threads.append(thread)
+                thread = threading.Thread(
+                    target=load_expert_w3_w1_weight,
+                    args=(w1_weight, w3_weight,
+                          dst_w3_w1_weights_tensor[expert_idx],
+                          is_trtllm_nvfp4))
+                thread.start()
+                threads.append(thread)
 
-            thread = threading.Thread(target=load_expert_w2_weight,
-                                      args=(w2_weight,
-                                            self.w2_weight.data[expert_idx],
-                                            is_trtllm_nvfp4))
-            thread.start()
-            threads.append(thread)
+                thread = threading.Thread(
+                    target=load_expert_w2_weight,
+                    args=(w2_weight, dst_w2_weights_tensor[expert_idx],
+                          is_trtllm_nvfp4))
+                thread.start()
+                threads.append(thread)
 
-        for thread in threads:
-            thread.join()
+            for thread in threads:
+                thread.join()
+
+        parallel_load_weights(self.initial_local_expert_ids,
+                              self.w3_w1_weight.data, self.w2_weight.data)
 
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
@@ -2041,7 +2147,62 @@ class FusedMoE(nn.Module):
             # Re-setup quant scales after loading weights as the tensors may have been modified.
             self.setup_quant_scales()
 
+        if self.layer_load_balancer and self.layer_load_balancer.need_load_shared_weights(
+        ):
+            for local_slot_id, expert_id in enumerate(
+                    self.initial_local_expert_ids):
+                self.layer_load_balancer.add_register_weight_fn(
+                    self.register_parameter_weight_slot_fn,
+                    ('w3_w1_weight', local_slot_id))
+                self.layer_load_balancer.add_register_weight_fn(
+                    self.register_parameter_weight_slot_fn,
+                    ('w2_weight', local_slot_id))
+            self.layer_load_balancer.add_to_fix_weight_fn(
+                self.register_to_fix_weight_fn, ('w3_w1_weight', ))
+            self.layer_load_balancer.add_to_fix_weight_fn(
+                self.register_to_fix_weight_fn, ('w2_weight', ))
+            local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids(
+            )
+            local_shared_w3_w1_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                self.w3_w1_weight.data.shape[1:],
+                dtype=self.w3_w1_weight.data.dtype,
+                device='cpu')
+            local_shared_w2_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                self.w2_weight.data.shape[1:],
+                dtype=self.w2_weight.data.dtype,
+                device='cpu')
+            parallel_load_weights(local_shared_load_expert_ids,
+                                  local_shared_w3_w1_tensors,
+                                  local_shared_w2_tensors)
+            for expert_id in range(self.num_experts):
+                if expert_id in local_shared_load_expert_ids:
+                    local_slot_id = local_shared_load_expert_ids.index(
+                        expert_id)
+                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
+                        expert_id, 'w3_w1_weight',
+                        local_shared_w3_w1_tensors[local_slot_id])
+                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
+                        expert_id, 'w2_weight',
+                        local_shared_w2_tensors[local_slot_id])
+                else:
+                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
+                        expert_id, 'w3_w1_weight',
+                        local_shared_w3_w1_tensors.dtype,
+                        local_shared_w3_w1_tensors[0].shape)
+                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
+                        expert_id, 'w2_weight', local_shared_w2_tensors.dtype,
+                        local_shared_w2_tensors[0].shape)
+            self.layer_load_balancer.host_tensor_sharer.finalize_layer_weights()
+
+        if self.layer_load_balancer:
+            self.layer_load_balancer.set_initial_weight_assignments(
+                self.initial_global_assignments)
+
     def _load_fp8_block_scales_scales(self, weights: Dict):
+        assert self.layer_load_balancer is None or not self.layer_load_balancer.need_load_shared_weights(),\
+            "fp8 block scale is not supported by MoE LoadBalancer yet."
         all_w2_scales = [
             load_weight_shard(weights[f"{expert_id}.w2.weight_scale_inv"],
                               self.tp_size, self.tp_rank,
@@ -2072,6 +2233,9 @@ class FusedMoE(nn.Module):
         self.w3_w1_weight_scaling_factor.data.copy_(w3_w1_scales)
 
     def _load_fp8_qdq_scales(self, weights: Dict):
+        assert self.layer_load_balancer is None or not self.layer_load_balancer.need_load_shared_weights(),\
+            "fp8 qdq is not supported by MoE LoadBalancer yet."
+
         # Step1: Load input scales.
         def load_expert_fc31_input_scale_fp8_qdq(
                 w1_input_scale, w3_input_scale,
@@ -2353,51 +2517,155 @@ class FusedMoE(nn.Module):
             dst_w2_alpha.copy_(1.0 /
                                (final_fc2_input_scale * w2_weight_scale_2))
 
-        for local_slot_id, expert_id in enumerate(
-                self.initial_local_expert_ids):
-            if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-                w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
-                w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
-                w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
-                w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
-                w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
-            elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
-                w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
-                    expert_id].transpose(0, 1).contiguous()
-                w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
-                    2, dim=0)
-                w2_weight_scale = weights["down_proj_weight_scale"][
-                    expert_id].transpose(0, 1).contiguous()
-                w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
-                w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
-                w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
-            else:
-                raise NotImplementedError(
-                    f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
-                )
+        def load_all_fp4_scales(load_expert_ids: List[int],
+                                dst_w3_w1_weight_scale: torch.Tensor,
+                                dst_w2_weight_scale: torch.Tensor,
+                                dst_fc31_alpha: torch.Tensor,
+                                dst_fc2_alpha: torch.Tensor):
+            for local_slot_id, expert_id in enumerate(load_expert_ids):
+                if self.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                    w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
+                    w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                    w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+                    w1_weight_scale_2 = weights[
+                        f"{expert_id}.w1.weight_scale_2"]
+                    w3_weight_scale_2 = weights[
+                        f"{expert_id}.w3.weight_scale_2"]
+                    w2_weight_scale_2 = weights[
+                        f"{expert_id}.w2.weight_scale_2"]
+                elif self.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                    w1_w3_weight_scale = weights["gate_up_proj_weight_scale"][
+                        expert_id].transpose(0, 1).contiguous()
+                    w1_weight_scale, w3_weight_scale = w1_w3_weight_scale.chunk(
+                        2, dim=0)
+                    w2_weight_scale = weights["down_proj_weight_scale"][
+                        expert_id].transpose(0, 1).contiguous()
+                    w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                    w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                    w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
+                else:
+                    raise NotImplementedError(
+                        f"Unknown weight loading mode in MoE: {self.weight_loading_mode}"
+                    )
 
-            expert_idx = local_slot_id
+                expert_idx = local_slot_id
 
-            load_expert_w3_w1_weight_scale_nvfp4(
-                w1_weight_scale, w3_weight_scale,
-                self.w3_w1_weight_scale.data[expert_idx], self.is_trtllm())
-            load_expert_w2_weight_scale_nvfp4(
-                w2_weight_scale, self.w2_weight_scale.data[expert_idx],
-                self.is_trtllm())
+                load_expert_w3_w1_weight_scale_nvfp4(
+                    w1_weight_scale, w3_weight_scale,
+                    dst_w3_w1_weight_scale[expert_idx], self.is_trtllm())
+                load_expert_w2_weight_scale_nvfp4(
+                    w2_weight_scale, dst_w2_weight_scale[expert_idx],
+                    self.is_trtllm())
 
-            load_expert_fc31_alpha_nvfp4(w1_weight_scale_2, w3_weight_scale_2,
-                                         self.fc31_input_scale.data,
-                                         self.fc31_alpha.data[expert_idx])
-            load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
-                                        self.fc2_input_scale.data,
-                                        self.fc2_alpha.data[expert_idx])
+                load_expert_fc31_alpha_nvfp4(w1_weight_scale_2,
+                                             w3_weight_scale_2,
+                                             self.fc31_input_scale.data,
+                                             dst_fc31_alpha[expert_idx])
+                load_expert_fc2_alpha_nvfp4(w2_weight_scale_2,
+                                            self.fc2_input_scale.data,
+                                            dst_fc2_alpha[expert_idx])
+
+        load_all_fp4_scales(self.initial_local_expert_ids,
+                            self.w3_w1_weight_scale.data,
+                            self.w2_weight_scale.data, self.fc31_alpha.data,
+                            self.fc2_alpha.data)
+
         if self.is_trtllm():
             self.fc31_scale_c.data.copy_(self.fc2_input_scale.data *
                                          self.fc31_alpha.data,
                                          non_blocking=True)
 
+        if self.layer_load_balancer and self.layer_load_balancer.need_load_shared_weights(
+        ):
+            for local_slot_id, expert_id in enumerate(
+                    self.initial_local_expert_ids):
+                self.layer_load_balancer.add_register_weight_fn(
+                    self.register_parameter_weight_slot_fn,
+                    ('w3_w1_weight_scale', local_slot_id))
+                self.layer_load_balancer.add_register_weight_fn(
+                    self.register_parameter_weight_slot_fn,
+                    ('w2_weight_scale', local_slot_id))
+                self.layer_load_balancer.add_register_weight_fn(
+                    self.register_parameter_weight_slot_fn,
+                    ('fc31_alpha', local_slot_id))
+                self.layer_load_balancer.add_register_weight_fn(
+                    self.register_parameter_weight_slot_fn,
+                    ('fc2_alpha', local_slot_id))
+
+            self.layer_load_balancer.add_to_fix_weight_fn(
+                self.register_to_fix_weight_fn, ('w3_w1_weight_scale', ))
+            self.layer_load_balancer.add_to_fix_weight_fn(
+                self.register_to_fix_weight_fn, ('w2_weight_scale', ))
+            self.layer_load_balancer.add_to_fix_weight_fn(
+                self.register_to_fix_weight_fn, ('fc31_alpha', ))
+            self.layer_load_balancer.add_to_fix_weight_fn(
+                self.register_to_fix_weight_fn, ('fc2_alpha', ))
+
+            local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids(
+            )
+            local_shared_w3_w1_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                self.w3_w1_weight_scale.data.shape[1:],
+                dtype=self.w3_w1_weight_scale.data.dtype,
+                device='cpu')
+            local_shared_w2_scale_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                self.w2_weight_scale.data.shape[1:],
+                dtype=self.w2_weight_scale.data.dtype,
+                device='cpu')
+            local_shared_fc31_alpha_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                self.fc31_alpha.data.shape[1:],
+                dtype=self.fc31_alpha.data.dtype,
+                device='cpu')
+            local_shared_fc2_alpha_tensors = torch.empty(
+                (len(local_shared_load_expert_ids), ) +
+                self.fc2_alpha.data.shape[1:],
+                dtype=self.fc2_alpha.data.dtype,
+                device='cpu')
+            load_all_fp4_scales(local_shared_load_expert_ids,
+                                local_shared_w3_w1_scale_tensors,
+                                local_shared_w2_scale_tensors,
+                                local_shared_fc31_alpha_tensors,
+                                local_shared_fc2_alpha_tensors)
+
+            for expert_id in range(self.num_experts):
+                if expert_id in local_shared_load_expert_ids:
+                    local_slot_id = local_shared_load_expert_ids.index(
+                        expert_id)
+                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
+                        expert_id, 'w3_w1_weight_scale',
+                        local_shared_w3_w1_scale_tensors[local_slot_id])
+                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
+                        expert_id, 'w2_weight_scale',
+                        local_shared_w2_scale_tensors[local_slot_id])
+                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
+                        expert_id, 'fc31_alpha',
+                        local_shared_fc31_alpha_tensors[local_slot_id])
+                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
+                        expert_id, 'fc2_alpha',
+                        local_shared_fc2_alpha_tensors[local_slot_id])
+                else:
+                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
+                        expert_id, 'w3_w1_weight_scale',
+                        local_shared_w3_w1_scale_tensors.dtype,
+                        local_shared_w3_w1_scale_tensors[0].shape)
+                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
+                        expert_id, 'w2_weight_scale',
+                        local_shared_w2_scale_tensors.dtype,
+                        local_shared_w2_scale_tensors[0].shape)
+                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
+                        expert_id, 'fc31_alpha',
+                        local_shared_fc31_alpha_tensors.dtype,
+                        local_shared_fc31_alpha_tensors[0].shape)
+                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
+                        expert_id, 'fc2_alpha',
+                        local_shared_fc2_alpha_tensors.dtype,
+                        local_shared_fc2_alpha_tensors[0].shape)
+
     def _load_int4_groupwise_scales(self, weights: Dict):
+        assert self.layer_load_balancer is None or not self.layer_load_balancer.need_load_shared_weights(), \
+            "_load_int4_groupwise_scales not supported as there are local max instead of max of all experts."
         # fc31 scales
         assert (len(self.interleave) == 2)
         all_w3_input_scales = [
