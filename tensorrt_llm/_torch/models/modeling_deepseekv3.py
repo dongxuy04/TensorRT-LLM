@@ -340,7 +340,8 @@ class Deepseekv3MoE(nn.Module):
                  shared_expert_intermediate_size: int,
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
                  dtype: Optional[torch.dtype] = None,
-                 model_config: ModelConfig = ModelConfig()):
+                 model_config: ModelConfig = ModelConfig(),
+                 layer_idx: Optional[int] = None):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -372,7 +373,8 @@ class Deepseekv3MoE(nn.Module):
             False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
             aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
-            enable_alltoall=self.enable_alltoall)
+            enable_alltoall=self.enable_alltoall,
+            layer_idx=layer_idx)
 
         self.mapping = model_config.mapping
 
@@ -581,7 +583,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 self.num_shared_experts,
                 dtype=config.torch_dtype,
                 model_config=model_config,
-                aux_stream_dict=aux_stream_dict)
+                aux_stream_dict=aux_stream_dict,
+                layer_idx=layer_idx)
         else:
             block_size = 1
             if model_config.quant_config and model_config.quant_config.group_size is not None:

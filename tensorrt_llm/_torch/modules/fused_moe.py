@@ -19,8 +19,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..distributed import allgather, reducescatter
-from ..model_config import ModelConfig
 from ..expert_statistic import ExpertStatistic
+from ..model_config import ModelConfig
 from ..utils import (EventType, Fp4QuantizedTensor, disable_fp4_allgather,
                      reswizzle_sf, swizzle_sf, unswizzle_sf)
 from .gated_mlp import GatedMLP
@@ -898,6 +898,7 @@ class FusedMoE(nn.Module):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         enable_alltoall: bool = False,
+        layer_idx: Optional[int] = None,
     ):
         from ..distributed import AllReduce
 
@@ -935,6 +936,7 @@ class FusedMoE(nn.Module):
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
+        self.layer_idx = layer_idx
         moe_load_balancer = get_moe_load_balancer()
         self.layer_load_balancer = None
         self.first_forward_call = True
@@ -952,9 +954,8 @@ class FusedMoE(nn.Module):
             self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
             self.layer_load_balancer = moe_load_balancer.add_layer(
                 self.num_experts, top_k, self.expert_size_per_partition)
-            load_balance_layer_idx = self.layer_load_balancer.get_layer_idx()
             loaded_initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
-                load_balance_layer_idx)
+                self.layer_idx)
             self.num_slots = moe_load_balancer_config.num_slots
             if loaded_initial_global_assignments is not None:
                 assert isinstance(loaded_initial_global_assignments, list)
@@ -969,7 +970,7 @@ class FusedMoE(nn.Module):
                 f"MoE load balancer enabled. num_experts = {num_experts}, num_slots = {self.num_slots}, ep_size = {self.ep_size}"
             )
             logger.info(
-                f"initial_global_assignments (layer {load_balance_layer_idx}) = {self.initial_global_assignments}"
+                f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
             )
         else:
             assert num_experts % self.ep_size == 0
